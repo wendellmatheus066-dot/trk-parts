@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { supabase } from './lib/supabase'
 import './App.css'
 
 type ReferenceItem = {
@@ -33,16 +34,11 @@ type CatalogItem = {
   fileType: string
   size: number
   createdAt: string
-  blob?: Blob
+  storagePath?: string
+  publicUrl?: string
 }
 
 type Page = 'Início' | 'Consultar' | 'Cadastrar' | 'Catálogos'
-
-const REF_KEY = 'trk_parts_reference_database_v2'
-const CATALOG_DB = 'trk_parts_catalogs_db'
-const CATALOG_STORE = 'catalogs'
-const REF_PHOTO_STORE = 'referencePhotos'
-const REF_PDF_STORE = 'referencePdfs'
 
 const emptyReference = {
   name: '',
@@ -55,7 +51,6 @@ const emptyReference = {
   notes: '',
 }
 
-const sampleReferences: ReferenceItem[] = []
 
 function uid() {
   return crypto.randomUUID()
@@ -78,96 +73,94 @@ function formatBytes(bytes: number) {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`
 }
 
-function openPartsDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(CATALOG_DB, 3)
-    request.onupgradeneeded = () => {
-      const db = request.result
-      if (!db.objectStoreNames.contains(CATALOG_STORE)) {
-        db.createObjectStore(CATALOG_STORE, { keyPath: 'id' })
-      }
-      if (!db.objectStoreNames.contains(REF_PHOTO_STORE)) {
-        const store = db.createObjectStore(REF_PHOTO_STORE, { keyPath: 'id' })
-        store.createIndex('referenceId', 'referenceId', { unique: false })
-      }
-      if (!db.objectStoreNames.contains(REF_PDF_STORE)) {
-        const store = db.createObjectStore(REF_PDF_STORE, { keyPath: 'id' })
-        store.createIndex('referenceId', 'referenceId', { unique: false })
-      }
-    }
-    request.onsuccess = () => resolve(request.result)
-    request.onerror = () => reject(request.error)
-  })
+function extensionFromType(type: string, fallback = 'bin') {
+  if (type === 'application/pdf') return 'pdf'
+  if (type.includes('png')) return 'png'
+  if (type.includes('webp')) return 'webp'
+  if (type.includes('gif')) return 'gif'
+  if (type.includes('jpeg') || type.includes('jpg')) return 'jpg'
+  return fallback
 }
 
-async function openCatalogDb(): Promise<IDBDatabase> {
-  return openPartsDb()
+async function listReferencePhotos(referenceId: string) {
+  const { data, error } = await supabase.storage.from('reference-photos').list(referenceId, { limit: 20 })
+  if (error) throw error
+  return (data || []).filter((item) => item.name.startsWith('photo-')).sort((a, b) => a.name.localeCompare(b.name))
 }
 
 async function getReferencePhotos(referenceId: string): Promise<{ id: string; referenceId: string; blob: Blob; name: string }[]> {
-  const db = await openPartsDb()
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(REF_PHOTO_STORE, 'readonly')
-    const request = tx.objectStore(REF_PHOTO_STORE).index('referenceId').getAll(referenceId)
-    request.onsuccess = () => resolve(request.result || [])
-    request.onerror = () => reject(request.error)
-  })
+  const files = await listReferencePhotos(referenceId)
+  const result: { id: string; referenceId: string; blob: Blob; name: string }[] = []
+
+  for (const file of files) {
+    const path = `${referenceId}/${file.name}`
+    const { data, error } = await supabase.storage.from('reference-photos').download(path)
+    if (error || !data) continue
+    result.push({ id: `${referenceId}-${file.name}`, referenceId, blob: data, name: file.name })
+  }
+
+  return result
 }
 
 async function saveReferencePhotos(referenceId: string, photos: Blob[]) {
-  const db = await openPartsDb()
-  return new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(REF_PHOTO_STORE, 'readwrite')
-    const store = tx.objectStore(REF_PHOTO_STORE)
-    const existing = store.index('referenceId').getAllKeys(referenceId)
-    existing.onsuccess = () => {
-      existing.result.forEach((key) => store.delete(key))
-      photos.slice(0, 4).forEach((blob, index) => {
-        store.put({ id: `${referenceId}-${index}`, referenceId, blob, name: blob instanceof File ? blob.name : `foto-${index + 1}` })
-      })
-    }
-    tx.oncomplete = () => resolve()
-    tx.onerror = () => reject(tx.error)
-  })
+  const oldFiles = await listReferencePhotos(referenceId).catch(() => [])
+  if (oldFiles.length) {
+    await supabase.storage.from('reference-photos').remove(oldFiles.map((file) => `${referenceId}/${file.name}`))
+  }
+
+  for (let index = 0; index < Math.min(photos.length, 4); index += 1) {
+    const blob = photos[index]
+    const type = blob.type || 'image/jpeg'
+    const extension = extensionFromType(type, 'jpg')
+    const path = `${referenceId}/photo-${index + 1}.${extension}`
+    const { error } = await supabase.storage.from('reference-photos').upload(path, blob, {
+      contentType: type,
+      upsert: true,
+    })
+    if (error) throw error
+  }
 }
 
 async function deleteReferencePhotos(referenceId: string) {
-  const db = await openPartsDb()
-  return new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(REF_PHOTO_STORE, 'readwrite')
-    const store = tx.objectStore(REF_PHOTO_STORE)
-    const request = store.index('referenceId').getAllKeys(referenceId)
-    request.onsuccess = () => request.result.forEach((key) => store.delete(key))
-    tx.oncomplete = () => resolve()
-    tx.onerror = () => reject(tx.error)
-  })
+  const files = await listReferencePhotos(referenceId).catch(() => [])
+  if (files.length) {
+    await supabase.storage.from('reference-photos').remove(files.map((file) => `${referenceId}/${file.name}`))
+  }
 }
 
 async function getReferencePdf(referenceId: string): Promise<ReferencePdf | null> {
-  const db = await openPartsDb()
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(REF_PDF_STORE, 'readonly')
-    const request = tx.objectStore(REF_PDF_STORE).index('referenceId').getAll(referenceId)
-    request.onsuccess = () => resolve(request.result?.[0] || null)
-    request.onerror = () => reject(request.error)
-  })
+  const { data: files, error: listError } = await supabase.storage.from('catalogs').list(`references/${referenceId}`, { limit: 10 })
+  if (listError || !files?.length) return null
+  const file = files.find((item) => item.name === 'document.pdf') || files[0]
+  if (!file) return null
+  const path = `references/${referenceId}/${file.name}`
+  const { data, error } = await supabase.storage.from('catalogs').download(path)
+  if (error || !data) return null
+  return {
+    id: `${referenceId}-pdf`,
+    referenceId,
+    blob: data,
+    name: file.name,
+    size: data.size,
+    type: data.type || 'application/pdf',
+  }
 }
 
 async function saveReferencePdf(referenceId: string, file: Blob | null, fileName?: string) {
-  const db = await openPartsDb()
-  return new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(REF_PDF_STORE, 'readwrite')
-    const store = tx.objectStore(REF_PDF_STORE)
-    const existing = store.index('referenceId').getAllKeys(referenceId)
-    existing.onsuccess = () => {
-      existing.result.forEach((key) => store.delete(key))
-      if (file) {
-        store.put({ id: `${referenceId}-pdf`, referenceId, blob: file, name: file instanceof File ? file.name : (fileName || 'arquivo.pdf'), size: file.size, type: file.type || 'application/pdf' })
-      }
-    }
-    tx.oncomplete = () => resolve()
-    tx.onerror = () => reject(tx.error)
+  const { data: files } = await supabase.storage.from('catalogs').list(`references/${referenceId}`, { limit: 20 })
+  if (files?.length) {
+    await supabase.storage.from('catalogs').remove(files.map((item) => `references/${referenceId}/${item.name}`))
+  }
+
+  if (!file) return
+
+  const path = `references/${referenceId}/document.pdf`
+  const { error } = await supabase.storage.from('catalogs').upload(path, file, {
+    contentType: file.type || 'application/pdf',
+    upsert: true,
   })
+  if (error) throw error
+  void fileName
 }
 
 async function deleteReferencePdf(referenceId: string) {
@@ -236,37 +229,59 @@ async function extractPdfReferences(file: File): Promise<{ reference: string; na
       }
     }
   }
+
   return found.slice(0, 200)
 }
 
 async function getCatalogs(): Promise<CatalogItem[]> {
-  const db = await openCatalogDb()
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(CATALOG_STORE, 'readonly')
-    const request = tx.objectStore(CATALOG_STORE).getAll()
-    request.onsuccess = () => resolve((request.result as CatalogItem[]).sort((a, b) => b.createdAt.localeCompare(a.createdAt)))
-    request.onerror = () => reject(request.error)
+  const { data, error } = await supabase
+    .from('catalogs')
+    .select('*')
+    .order('created_at', { ascending: false })
+
+  if (error) throw error
+
+  return (data || []).map((item) => {
+    const publicUrl = item.storage_path
+      ? supabase.storage.from('catalogs').getPublicUrl(item.storage_path).data.publicUrl
+      : undefined
+
+    return {
+      id: item.id,
+      name: item.name,
+      category: item.category || '',
+      notes: item.notes || '',
+      fileName: item.file_name,
+      fileType: item.file_type || '',
+      size: Number(item.file_size || 0),
+      createdAt: item.created_at,
+      storagePath: item.storage_path || undefined,
+      publicUrl,
+    }
   })
 }
 
 async function putCatalog(item: CatalogItem) {
-  const db = await openCatalogDb()
-  return new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(CATALOG_STORE, 'readwrite')
-    tx.objectStore(CATALOG_STORE).put(item)
-    tx.oncomplete = () => resolve()
-    tx.onerror = () => reject(tx.error)
+  const { error } = await supabase.from('catalogs').insert({
+    id: item.id,
+    name: item.name,
+    category: item.category,
+    notes: item.notes,
+    file_name: item.fileName,
+    file_type: item.fileType,
+    file_size: item.size,
+    storage_path: item.storagePath,
+    created_at: item.createdAt,
   })
+  if (error) throw error
 }
 
-async function removeCatalog(id: string) {
-  const db = await openCatalogDb()
-  return new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(CATALOG_STORE, 'readwrite')
-    tx.objectStore(CATALOG_STORE).delete(id)
-    tx.oncomplete = () => resolve()
-    tx.onerror = () => reject(tx.error)
-  })
+async function removeCatalog(id: string, storagePath?: string) {
+  if (storagePath) {
+    await supabase.storage.from('catalogs').remove([storagePath])
+  }
+  const { error } = await supabase.from('catalogs').delete().eq('id', id)
+  if (error) throw error
 }
 
 function ReferenceResultPhoto({ referenceId }: { referenceId: string }) {
@@ -275,11 +290,13 @@ function ReferenceResultPhoto({ referenceId }: { referenceId: string }) {
   useEffect(() => {
     let active = true
     let objectUrl: string | null = null
+
     getReferencePhotos(referenceId).then((photos) => {
       if (!active || !photos[0]) return
       objectUrl = URL.createObjectURL(photos[0].blob)
       setUrl(objectUrl)
     }).catch(() => {})
+
     return () => {
       active = false
       if (objectUrl) URL.revokeObjectURL(objectUrl)
@@ -292,29 +309,27 @@ function ReferenceResultPhoto({ referenceId }: { referenceId: string }) {
 
 function ReferencePdfButton({ referenceId }: { referenceId: string }) {
   const [pdf, setPdf] = useState<ReferencePdf | null>(null)
+
   useEffect(() => {
     getReferencePdf(referenceId).then(setPdf).catch(() => setPdf(null))
   }, [referenceId])
+
   if (!pdf) return null
+
   return (
     <button className="pdf-chip" type="button" onClick={() => {
       const url = URL.createObjectURL(pdf.blob)
       window.open(url, '_blank', 'noopener,noreferrer')
       setTimeout(() => URL.revokeObjectURL(url), 60_000)
-    }}>📄 Ver PDF • {pdf.name}</button>
+    }}>
+      📄 Ver PDF • {pdf.name}
+    </button>
   )
 }
 
 function App() {
   const [page, setPage] = useState<Page>('Início')
-  const [references, setReferences] = useState<ReferenceItem[]>(() => {
-    try {
-      const saved = localStorage.getItem(REF_KEY)
-      return saved ? JSON.parse(saved) : sampleReferences
-    } catch {
-      return sampleReferences
-    }
-  })
+  const [references, setReferences] = useState<ReferenceItem[]>([])
   const [query, setQuery] = useState('')
   const [referenceForm, setReferenceForm] = useState(emptyReference)
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -336,13 +351,47 @@ function App() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
+  async function loadReferences() {
+    const { data, error } = await supabase
+      .from('references')
+      .select('*')
+      .order('created_at', { ascending: false })
+
+    if (error) {
+      console.error(error)
+      alert(`Erro ao carregar referências: ${error.message}`)
+      return
+    }
+
+    const loaded: ReferenceItem[] = (data || []).map((item) => ({
+      id: item.id,
+      name: item.name || '',
+      reference: item.reference || '',
+      measurement: item.measurement || '',
+      manufacturer: item.manufacturer || '',
+      equivalents: item.equivalents || '',
+      originalCode: item.original_code || '',
+      category: item.category || '',
+      notes: item.notes || '',
+      createdAt: item.created_at,
+      updatedAt: item.updated_at,
+    }))
+
+    setReferences(loaded)
+  }
+
+  async function loadCatalogs() {
+    try {
+      setCatalogs(await getCatalogs())
+    } catch (error) {
+      console.error(error)
+      alert('Não foi possível carregar os catálogos do Supabase.')
+    }
+  }
 
   useEffect(() => {
-    localStorage.setItem(REF_KEY, JSON.stringify(references))
-  }, [references])
-
-  useEffect(() => {
-    getCatalogs().then(setCatalogs).catch(() => {})
+    void loadReferences()
+    void loadCatalogs()
   }, [])
 
   const filteredReferences = useMemo(() => {
@@ -422,39 +471,40 @@ function App() {
 
     const now = new Date().toISOString()
     const id = editingId || uid()
-    const saved: ReferenceItem = {
+    const existing = references.find((item) => item.id === editingId)
+
+    const row = {
       id,
       name: referenceForm.name.trim(),
       reference: referenceForm.reference.trim(),
       measurement: referenceForm.measurement.trim(),
       manufacturer: referenceForm.manufacturer.trim(),
       equivalents: referenceForm.equivalents.trim(),
-      originalCode: referenceForm.originalCode.trim(),
+      original_code: referenceForm.originalCode.trim(),
       category: referenceForm.category.trim(),
       notes: referenceForm.notes.trim(),
-      createdAt: editingId ? (references.find((item) => item.id === editingId)?.createdAt || now) : now,
-      updatedAt: now,
+      created_at: existing?.createdAt || now,
+      updated_at: now,
     }
 
-    setReferences((current) =>
-      editingId
-        ? current.map((item) => item.id === editingId ? saved : item)
-        : [saved, ...current]
-    )
-
     try {
+      const { error } = await supabase.from('references').upsert(row)
+      if (error) throw error
+
       await saveReferencePhotos(id, referencePhotos)
       await saveReferencePdf(
         id,
         referencePdf || savedReferencePdf?.blob || null,
-        referencePdf?.name || savedReferencePdf?.name
+        referencePdf?.name || savedReferencePdf?.name,
       )
-    } catch {
-      alert('A referência foi salva, mas houve um problema ao guardar as fotos/PDF neste navegador.')
-    }
 
-    resetReferenceForm()
-    setPage('Consultar')
+      await loadReferences()
+      resetReferenceForm()
+      setPage('Consultar')
+    } catch (error: any) {
+      console.error(error)
+      alert(`Não foi possível salvar a referência: ${error?.message || 'erro desconhecido'}`)
+    }
   }
 
   async function editReference(item: ReferenceItem) {
@@ -469,6 +519,7 @@ function App() {
       notes: item.notes,
     })
     setEditingId(item.id)
+
     try {
       const savedPhotos = await getReferencePhotos(item.id)
       const savedPdf = await getReferencePdf(item.id)
@@ -481,16 +532,25 @@ function App() {
     } catch {
       setReferencePhotos([])
       clearPhotoUrls()
+      setSavedReferencePdf(null)
     }
+
     setPage('Cadastrar')
   }
 
   async function deleteReference(id: string) {
     if (!confirm('Excluir esta referência?')) return
 
-    setReferences((current) => current.filter((item) => item.id !== id))
-    await deleteReferencePhotos(id).catch(() => {})
-    await deleteReferencePdf(id).catch(() => {})
+    try {
+      const { error } = await supabase.from('references').delete().eq('id', id)
+      if (error) throw error
+      await deleteReferencePhotos(id)
+      await deleteReferencePdf(id)
+      setReferences((current) => current.filter((item) => item.id !== id))
+    } catch (error: any) {
+      console.error(error)
+      alert(`Não foi possível excluir: ${error?.message || 'erro desconhecido'}`)
+    }
   }
 
   async function handlePdfImport() {
@@ -508,33 +568,47 @@ function App() {
     }
   }
 
-  function importCandidates() {
+  async function importCandidates() {
     if (!pdfImportCandidates.length) return
+
     const now = new Date().toISOString()
-    const additions: ReferenceItem[] = pdfImportCandidates.map((candidate) => ({
-      id: uid(),
-      name: candidate.name,
-      reference: candidate.reference,
-      measurement: '',
-      manufacturer: '',
-      equivalents: '',
-      originalCode: '',
-      category: 'Importado de PDF',
-      notes: `Importado do arquivo ${pdfImportFile?.name || 'PDF'}. Confira os dados antes de usar.`,
-      createdAt: now,
-      updatedAt: now,
-    }))
-    setReferences((current) => {
-      const existing = new Set(current.map((item) => normalize(item.reference)))
-      return [...additions.filter((item) => !existing.has(normalize(item.reference))), ...current]
-    })
-    setPdfImportOpen(false)
-    setPdfImportFile(null)
-    setPdfImportCandidates([])
-    alert(`${additions.length} referência(s) importada(s). Confira os dados no banco.`)
+    const existing = new Set(references.map((item) => normalize(item.reference)))
+    const additions = pdfImportCandidates
+      .filter((candidate) => !existing.has(normalize(candidate.reference)))
+      .map((candidate) => ({
+        id: uid(),
+        name: candidate.name,
+        reference: candidate.reference,
+        measurement: '',
+        manufacturer: '',
+        equivalents: '',
+        original_code: '',
+        category: 'Importado de PDF',
+        notes: `Importado do arquivo ${pdfImportFile?.name || 'PDF'}. Confira os dados antes de usar.`,
+        created_at: now,
+        updated_at: now,
+      }))
+
+    if (!additions.length) {
+      alert('Nenhuma referência nova para importar.')
+      return
+    }
+
+    try {
+      const { error } = await supabase.from('references').insert(additions)
+      if (error) throw error
+      await loadReferences()
+      setPdfImportOpen(false)
+      setPdfImportFile(null)
+      setPdfImportCandidates([])
+      alert(`${additions.length} referência(s) importada(s).`)
+    } catch (error: any) {
+      console.error(error)
+      alert(`Não foi possível importar: ${error?.message || 'erro desconhecido'}`)
+    }
   }
 
-async function saveCatalog(event: React.FormEvent) {
+  async function saveCatalog(event: React.FormEvent) {
     event.preventDefault()
     if (!selectedFile || !catalogName.trim()) {
       alert('Informe o nome e selecione um arquivo.')
@@ -547,42 +621,66 @@ async function saveCatalog(event: React.FormEvent) {
       return
     }
 
-    const item: CatalogItem = {
-      id: uid(),
-      name: catalogName.trim(),
-      category: catalogCategoryForm.trim() || 'Geral',
-      notes: catalogNotes.trim(),
-      fileName: selectedFile.name,
-      fileType: selectedFile.type,
-      size: selectedFile.size,
-      createdAt: new Date().toISOString(),
-      blob: selectedFile,
-    }
+    const id = uid()
+    const createdAt = new Date().toISOString()
+    const safeName = selectedFile.name.replace(/[^a-zA-Z0-9._-]/g, '_')
+    const storagePath = `${id}/${safeName}`
 
     try {
+      const { error: uploadError } = await supabase.storage.from('catalogs').upload(storagePath, selectedFile, {
+        contentType: selectedFile.type,
+        upsert: false,
+      })
+      if (uploadError) throw uploadError
+
+      const item: CatalogItem = {
+        id,
+        name: catalogName.trim(),
+        category: catalogCategoryForm.trim() || 'Geral',
+        notes: catalogNotes.trim(),
+        fileName: selectedFile.name,
+        fileType: selectedFile.type,
+        size: selectedFile.size,
+        createdAt,
+        storagePath,
+        publicUrl: supabase.storage.from('catalogs').getPublicUrl(storagePath).data.publicUrl,
+      }
+
       await putCatalog(item)
-      setCatalogs(await getCatalogs())
+      await loadCatalogs()
       setCatalogName('')
       setCatalogCategoryForm('')
       setCatalogNotes('')
       setSelectedFile(null)
       if (fileInputRef.current) fileInputRef.current.value = ''
       setCatalogFormOpen(false)
-    } catch {
-      alert('Não foi possível guardar o catálogo neste navegador.')
+    } catch (error: any) {
+      console.error(error)
+      await supabase.storage.from('catalogs').remove([storagePath]).catch(() => {})
+      alert(`Não foi possível guardar o catálogo: ${error?.message || 'erro desconhecido'}`)
     }
   }
 
   async function openCatalog(item: CatalogItem) {
-    if (!item.blob) return
-    const url = URL.createObjectURL(item.blob)
+    if (!item.storagePath) return
+    const { data, error } = await supabase.storage.from('catalogs').download(item.storagePath)
+    if (error || !data) {
+      alert('Não foi possível abrir o arquivo.')
+      return
+    }
+    const url = URL.createObjectURL(data)
     window.open(url, '_blank', 'noopener,noreferrer')
     setTimeout(() => URL.revokeObjectURL(url), 60_000)
   }
 
   async function downloadCatalog(item: CatalogItem) {
-    if (!item.blob) return
-    const url = URL.createObjectURL(item.blob)
+    if (!item.storagePath) return
+    const { data, error } = await supabase.storage.from('catalogs').download(item.storagePath)
+    if (error || !data) {
+      alert('Não foi possível baixar o arquivo.')
+      return
+    }
+    const url = URL.createObjectURL(data)
     const anchor = document.createElement('a')
     anchor.href = url
     anchor.download = item.fileName
@@ -592,10 +690,15 @@ async function saveCatalog(event: React.FormEvent) {
     setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
 
-  async function deleteCatalog(id: string) {
-    if (!confirm('Excluir este catálogo do acervo local?')) return
-    await removeCatalog(id)
-    setCatalogs(await getCatalogs())
+  async function deleteCatalog(id: string, storagePath?: string) {
+    if (!confirm('Excluir este catálogo?')) return
+    try {
+      await removeCatalog(id, storagePath)
+      await loadCatalogs()
+    } catch (error: any) {
+      console.error(error)
+      alert(`Não foi possível excluir: ${error?.message || 'erro desconhecido'}`)
+    }
   }
 
   function renderHeader(title: string, description: string) {
@@ -610,66 +713,43 @@ async function saveCatalog(event: React.FormEvent) {
     )
   }
 
-
   function renderHome() {
     return (
       <section className="content">
         <div className="hero">
-          <div className="eyebrow">BANCO TÉCNICO PESSOAL</div>
+          <div className="eyebrow">BANCO TÉCNICO ONLINE</div>
           <h2>Encontre uma peça em segundos.</h2>
-          <p></p>
+          <p>Referências e catálogos sincronizados na nuvem.</p>
           <div className="hero-search">
             <span>⌕</span>
-            <input
-              autoFocus
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') goToSearch()
-              }}
-              placeholder="Ex.: rolamento de centro, 1R-1808, 50 x 90 x 23"
-            />
+            <input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') goToSearch() }} placeholder="Ex.: rolamento de centro, 1R-1808, 50 x 90 x 23" />
             <button onClick={() => goToSearch()}>Pesquisar</button>
           </div>
-          <div className="search-hints">
-            <span>Nome</span><span>Referência</span><span>Medida</span><span>Fabricante</span><span>Equivalente</span>
-          </div>
+          <div className="search-hints"><span>Nome</span><span>Referência</span><span>Medida</span><span>Fabricante</span><span>Equivalente</span></div>
         </div>
 
         <div className="stats-grid">
-          <button className="stat" onClick={() => setPage('Consultar')}>
-            <strong>{references.length}</strong><span>REFERÊNCIAS</span><small>Consultar banco →</small>
-          </button>
-          <button className="stat" onClick={() => setPage('Cadastrar')}>
-            <strong>+</strong><span>NOVA REFERÊNCIA</span><small>Cadastrar peça →</small>
-          </button>
-          <button className="stat" onClick={() => setPage('Catálogos')}>
-            <strong>{catalogs.length}</strong><span>CATÁLOGOS</span><small>Abrir meu acervo →</small>
-          </button>
+          <button className="stat" onClick={() => setPage('Consultar')}><strong>{references.length}</strong><span>REFERÊNCIAS</span><small>Consultar banco →</small></button>
+          <button className="stat" onClick={() => setPage('Cadastrar')}><strong>+</strong><span>NOVA REFERÊNCIA</span><small>Cadastrar peça →</small></button>
+          <button className="stat" onClick={() => setPage('Catálogos')}><strong>{catalogs.length}</strong><span>CATÁLOGOS</span><small>Abrir acervo →</small></button>
         </div>
 
         <div className="home-grid">
           <section className="panel">
-            <div className="panel-head">
-              <div><h3>Consultas recentes</h3><p>As últimas referências cadastradas.</p></div>
-              <button className="text-button" onClick={() => setPage('Consultar')}>Ver banco →</button>
-            </div>
+            <div className="panel-head"><div><h3>Consultas recentes</h3><p>As últimas referências cadastradas.</p></div><button className="text-button" onClick={() => setPage('Consultar')}>Ver banco →</button></div>
             {references.length === 0 ? (
-              <div className="empty"><strong>Seu banco ainda está vazio.</strong><span></span><button onClick={() => setPage('Cadastrar')}>CADASTRAR PRIMEIRA</button></div>
+              <div className="empty"><strong>Seu banco ainda está vazio.</strong><span>Cadastre a primeira peça.</span><button onClick={() => setPage('Cadastrar')}>CADASTRAR PRIMEIRA</button></div>
             ) : (
               <div className="mini-list">
                 {references.slice(0, 6).map((item) => (
-                  <button key={item.id} className="mini-row" onClick={() => goToSearch(item.reference)}>
-                    <div><strong>{item.name}</strong><span>{item.manufacturer || 'Fabricante não informado'} {item.category ? `• ${item.category}` : ''}</span></div>
-                    <b>{item.reference}</b>
-                  </button>
+                  <button key={item.id} className="mini-row" onClick={() => goToSearch(item.reference)}><div><strong>{item.name}</strong><span>{item.manufacturer || 'Fabricante não informado'} {item.category ? `• ${item.category}` : ''}</span></div><b>{item.reference}</b></button>
                 ))}
               </div>
             )}
           </section>
 
           <section className="panel">
-            <div className="panel-head"><div><h3>Meu acervo</h3><p>Catálogos guardados neste navegador.</p></div><button className="text-button" onClick={() => setPage('Catálogos')}>Abrir →</button></div>
+            <div className="panel-head"><div><h3>Meu acervo</h3><p>Catálogos salvos na nuvem.</p></div><button className="text-button" onClick={() => setPage('Catálogos')}>Abrir →</button></div>
             {catalogs.length === 0 ? (
               <div className="empty compact"><strong>Nenhum catálogo ainda.</strong><span>Guarde seus PDFs e imagens técnicos aqui.</span></div>
             ) : (
@@ -687,13 +767,8 @@ async function saveCatalog(event: React.FormEvent) {
     return (
       <section className="content">
         {renderHeader('Consultar referências', '')}
-        <div className="big-search">
-          <span>⌕</span>
-          <input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Ex.: rolamento de centro 50 x 90 x 23" />
-          {query && <button onClick={() => setQuery('')}>Limpar</button>}
-        </div>
+        <div className="big-search"><span>⌕</span><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Ex.: rolamento de centro 50 x 90 x 23" />{query && <button onClick={() => setQuery('')}>Limpar</button>}</div>
         <div className="result-bar"><strong>{filteredReferences.length}</strong> resultado(s) encontrado(s)</div>
-
         {filteredReferences.length === 0 ? (
           <div className="empty large"><strong>Nenhuma referência encontrada.</strong><span>Tente outra palavra, parte da referência ou a medida.</span><button onClick={() => setPage('Cadastrar')}>CADASTRAR ESTA PEÇA</button></div>
         ) : (
@@ -737,11 +812,7 @@ async function saveCatalog(event: React.FormEvent) {
           </div>
           <div className="photo-section">
             <div className="photo-section-head"><div><strong>Fotos da peça</strong><span>Até 4 fotos. Frente, lateral, embalagem ou referência gravada.</span></div><label className="photo-add">+ Adicionar fotos<input type="file" accept="image/jpeg,image/png,image/webp,image/gif" multiple onChange={(e) => addReferencePhotos(e.target.files)} /></label></div>
-            {referencePhotoUrls.length > 0 ? (
-              <div className="photo-grid">
-                {referencePhotoUrls.map((url, index) => <div className="photo-item" key={`${url}-${index}`}><img src={url} alt={`Foto ${index + 1} da peça`} /><button type="button" onClick={() => removeReferencePhoto(index)}>×</button></div>)}
-              </div>
-            ) : <div className="photo-empty">Nenhuma foto adicionada.</div>}
+            {referencePhotoUrls.length > 0 ? <div className="photo-grid">{referencePhotoUrls.map((url, index) => <div className="photo-item" key={`${url}-${index}`}><img src={url} alt={`Foto ${index + 1} da peça`} /><button type="button" onClick={() => removeReferencePhoto(index)}>×</button></div>)}</div> : <div className="photo-empty">Nenhuma foto adicionada.</div>}
           </div>
           <div className="pdf-attach-section">
             <div><strong>📄 PDF da peça / catálogo</strong><span>Você pode guardar o PDF específico junto desta referência.</span></div>
@@ -766,14 +837,10 @@ async function saveCatalog(event: React.FormEvent) {
 
         {pdfImportOpen && (
           <div className="form-card catalog-form import-card">
-            <div className="form-grid">
-              <label className="full">PDF para leitura<input type="file" accept="application/pdf" onChange={(e) => { setPdfImportFile(e.target.files?.[0] || null); setPdfImportCandidates([]) }} /></label>
-            </div>
+            <div className="form-grid"><label className="full">PDF para leitura<input type="file" accept="application/pdf" onChange={(e) => { setPdfImportFile(e.target.files?.[0] || null); setPdfImportCandidates([]) }} /></label></div>
             {pdfImportFile && <div className="selected-file">{pdfImportFile.name} • {formatBytes(pdfImportFile.size)}</div>}
             <div className="form-actions"><button type="button" className="secondary" onClick={() => { setPdfImportOpen(false); setPdfImportFile(null); setPdfImportCandidates([]) }}>Cancelar</button><button type="button" className="primary" disabled={!pdfImportFile || pdfImporting} onClick={handlePdfImport}>{pdfImporting ? 'Lendo PDF...' : 'Ler PDF'}</button></div>
-            {pdfImportCandidates.length > 0 && (
-              <div className="import-results"><strong>{pdfImportCandidates.length} referências encontradas</strong><div className="import-list">{pdfImportCandidates.slice(0, 30).map((item, index) => <div key={`${item.reference}-${index}`}><b>{item.reference}</b><span>{item.name}</span></div>)}</div><button type="button" className="primary" onClick={importCandidates}>Importar para o banco</button><small>As referências entram como rascunho para você conferir e completar medida/fabricante.</small></div>
-            )}
+            {pdfImportCandidates.length > 0 && <div className="import-results"><strong>{pdfImportCandidates.length} referências encontradas</strong><div className="import-list">{pdfImportCandidates.slice(0, 30).map((item, index) => <div key={`${item.reference}-${index}`}><b>{item.reference}</b><span>{item.name}</span></div>)}</div><button type="button" className="primary" onClick={importCandidates}>Importar para o banco</button><small>As referências entram como rascunho para você conferir e completar medida/fabricante.</small></div>}
           </div>
         )}
 
@@ -791,7 +858,7 @@ async function saveCatalog(event: React.FormEvent) {
         )}
 
         {filteredCatalogs.length === 0 ? (
-          <div className="empty large"><strong>Nenhum catálogo encontrado.</strong><span></span><button onClick={() => setCatalogFormOpen(true)}>ADICIONAR CATÁLOGO</button></div>
+          <div className="empty large"><strong>Nenhum catálogo encontrado.</strong><span>Adicione seu primeiro catálogo.</span><button onClick={() => setCatalogFormOpen(true)}>ADICIONAR CATÁLOGO</button></div>
         ) : (
           <div className="catalog-grid">
             {filteredCatalogs.map((item) => (
@@ -799,7 +866,7 @@ async function saveCatalog(event: React.FormEvent) {
                 <div className="file-badge">{item.fileType === 'application/pdf' ? 'PDF' : 'IMG'}</div>
                 <div className="catalog-info"><span>{item.category}</span><h3>{item.name}</h3><p>{item.fileName}</p><small>{formatBytes(item.size)} • {new Date(item.createdAt).toLocaleDateString('pt-BR')}</small></div>
                 {item.notes && <div className="catalog-notes">{item.notes}</div>}
-                <div className="catalog-actions"><button onClick={() => openCatalog(item)}>Abrir</button><button onClick={() => downloadCatalog(item)}>Baixar</button><button className="danger" onClick={() => deleteCatalog(item.id)}>Excluir</button></div>
+                <div className="catalog-actions"><button onClick={() => openCatalog(item)}>Abrir</button><button onClick={() => downloadCatalog(item)}>Baixar</button><button className="danger" onClick={() => deleteCatalog(item.id, item.storagePath)}>Excluir</button></div>
               </article>
             ))}
           </div>
@@ -812,29 +879,17 @@ async function saveCatalog(event: React.FormEvent) {
     <div className="app">
       <aside className="sidebar">
         <div className="brand"><img className="brand-logo" src="/trk-parts-logo.png" alt="TRK PARTS" /><small>REFERÊNCIAS • MEDIDAS • CATÁLOGOS</small></div>
-        <nav>
-          {(['Início', 'Consultar', 'Cadastrar', 'Catálogos'] as Page[]).map((item) => (
-            <button key={item} className={page === item ? 'active' : ''} onClick={() => { setPage(item); if (item === 'Cadastrar' && !editingId) resetReferenceForm() }}>{item}</button>
-          ))}
-        </nav>
-        <div className="sidebar-bottom">
-          <strong>{references.length}</strong><span>referências salvas</span>
-          <strong>{catalogs.length}</strong><span>catálogos salvos</span>
-        </div>
+        <nav>{(['Início', 'Consultar', 'Cadastrar', 'Catálogos'] as Page[]).map((item) => <button key={item} className={page === item ? 'active' : ''} onClick={() => { setPage(item); if (item === 'Cadastrar' && !editingId) resetReferenceForm() }}>{item}</button>)}</nav>
+        <div className="sidebar-bottom"><strong>{references.length}</strong><span>referências salvas</span><strong>{catalogs.length}</strong><span>catálogos salvos</span></div>
       </aside>
 
       <main className="main">
-        <header className="topbar">
-          <div className="top-search"><span>⌕</span><input value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') goToSearch() }} placeholder="Pesquisar peça, referência ou medida..." /><kbd>/</kbd></div>
-          <button className="top-catalog" onClick={() => setPage('Catálogos')}>Meus catálogos</button>
-        </header>
-
+        <header className="topbar"><div className="top-search"><span>⌕</span><input value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') goToSearch() }} placeholder="Pesquisar peça, referência ou medida..." /><kbd>/</kbd></div><button className="top-catalog" onClick={() => setPage('Catálogos')}>Meus catálogos</button></header>
         {page === 'Início' && renderHome()}
         {page === 'Consultar' && renderConsult()}
         {page === 'Cadastrar' && renderRegister()}
         {page === 'Catálogos' && renderCatalogs()}
-
-        <footer>TRK PARTS • Banco pessoal de referências e catálogos</footer>
+        <footer>TRK PARTS • Banco técnico online</footer>
       </main>
     </div>
   )
