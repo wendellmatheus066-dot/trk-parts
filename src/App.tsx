@@ -617,7 +617,7 @@ async function saveCatalog(event: React.FormEvent) {
         <div className="hero">
           <div className="eyebrow">BANCO TÉCNICO PESSOAL</div>
           <h2>Encontre uma peça em segundos.</h2>
-          <p>Digite o nome, referência, medida ou código. O TRK PARTS procura em todo o seu banco.</p>
+          <p></p>
           <div className="hero-search">
             <span>⌕</span>
             <input
@@ -655,7 +655,7 @@ async function saveCatalog(event: React.FormEvent) {
               <button className="text-button" onClick={() => setPage('Consultar')}>Ver banco →</button>
             </div>
             {references.length === 0 ? (
-              <div className="empty"><strong>Seu banco ainda está vazio.</strong><span>Cadastre uma referência e ela ficará disponível para pesquisa.</span><button onClick={() => setPage('Cadastrar')}>CADASTRAR PRIMEIRA</button></div>
+              <div className="empty"><strong>Seu banco ainda está vazio.</strong><span></span><button onClick={() => setPage('Cadastrar')}>CADASTRAR PRIMEIRA</button></div>
             ) : (
               <div className="mini-list">
                 {references.slice(0, 6).map((item) => (
@@ -686,7 +686,7 @@ async function saveCatalog(event: React.FormEvent) {
   function renderConsult() {
     return (
       <section className="content">
-        {renderHeader('Consultar referências', 'Pesquise por nome, referência, medida, fabricante ou equivalente.')}
+        {renderHeader('Consultar referências', '')}
         <div className="big-search">
           <span>⌕</span>
           <input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Ex.: rolamento de centro 50 x 90 x 23" />
@@ -723,7 +723,7 @@ async function saveCatalog(event: React.FormEvent) {
   function renderRegister() {
     return (
       <section className="content narrow-content">
-        {renderHeader(editingId ? 'Editar referência' : 'Cadastrar referência', 'Guarde a informação técnica para consultar depois.')}
+        {renderHeader(editingId ? 'Editar referência' : 'Cadastrar referência', '')}
         <form className="form-card" onSubmit={saveReference}>
           <div className="form-grid">
             <label>Nome da peça *<input value={referenceForm.name} onChange={(e) => setReferenceForm({ ...referenceForm, name: e.target.value })} placeholder="Ex.: Rolamento de centro" /></label>
@@ -757,7 +757,7 @@ async function saveCatalog(event: React.FormEvent) {
   function renderCatalogs() {
     return (
       <section className="content">
-        {renderHeader('Meus catálogos', 'Guarde PDFs e imagens técnicos no próprio aplicativo, separados das referências.')}
+        {renderHeader('Meus catálogos', '')}
         <div className="catalog-toolbar">
           <div className="big-search small"><span>⌕</span><input value={catalogQuery} onChange={(e) => setCatalogQuery(e.target.value)} placeholder="Pesquisar catálogo..." /></div>
           <select value={catalogCategory} onChange={(e) => setCatalogCategory(e.target.value)}>{catalogCategories.map((category) => <option key={category}>{category}</option>)}</select>
@@ -791,7 +791,7 @@ async function saveCatalog(event: React.FormEvent) {
         )}
 
         {filteredCatalogs.length === 0 ? (
-          <div className="empty large"><strong>Nenhum catálogo encontrado.</strong><span>Adicione seus PDFs, manuais, catálogos de fabricantes e tabelas técnicas.</span><button onClick={() => setCatalogFormOpen(true)}>ADICIONAR CATÁLOGO</button></div>
+          <div className="empty large"><strong>Nenhum catálogo encontrado.</strong><span></span><button onClick={() => setCatalogFormOpen(true)}>ADICIONAR CATÁLOGO</button></div>
         ) : (
           <div className="catalog-grid">
             {filteredCatalogs.map((item) => (
